@@ -1,1 +1,152 @@
+(async () => {
+  const FIRST_URL = 'PASTE_URL_HERE';
+  const INIT = {
+    // PASTE the {...} object from "Copy as fetch" here (headers, credentials, mode, ...)
+  };
 
+  // Test run: set MAX_PAGES to e.g. 2 (and PAGE_SIZE to e.g. 20) to fetch just a little and
+  // download "-test" files. Set MAX_PAGES back to 0 (no limit) for the full export.
+  const MAX_PAGES = 2;
+  const PAGE_SIZE = 20;
+  const PAUSE_MS = 300;
+  const MAX_RETRIES = 6;
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  const state = (window.__teamsExport ??= { messages: new Map(), next: null, done: false });
+  if (state.done) {
+    console.log('Previous export finished. Run `delete window.__teamsExport` to start over.');
+    return;
+  }
+
+  let url = state.next || withPageSize(FIRST_URL);
+  const init = { ...INIT, method: 'GET', body: undefined };
+  const conversationId = decodeURIComponent(
+    (url.match(/conversations\/([^/?]+)/) || [])[1] || 'unknown',
+  );
+  const fileBase = 'chat-' + conversationId.replace(/[^\w.-]+/g, '_').slice(0, 60);
+
+  console.log(state.next ? 'Resuming export...' : 'Starting export...');
+
+  const rawPages = [];
+  let pages = 0;
+  while (url) {
+    const res = await fetchWithRetry(url);
+    if (!res) {
+      state.next = url;
+      console.warn('Stopped early (see error above). Saving partial export.');
+      console.warn('To resume: paste a fresh INIT (new token) and run the script again.');
+      save('-partial');
+      return;
+    }
+
+    const page = await res.json();
+    if (MAX_PAGES) rawPages.push(page);
+    const batch = page.messages || [];
+    for (const m of batch) state.messages.set(m.id, m);
+
+    const oldest = batch.length ? batch[batch.length - 1].originalarrivaltime : '-';
+    console.log(`+${batch.length} (total ${state.messages.size}), reached ${oldest}`);
+
+    const next = page._metadata && page._metadata.backwardLink;
+    if (!batch.length || !next || next === url) break;
+    if (MAX_PAGES && ++pages >= MAX_PAGES) {
+      console.log(`Test run: stopped after ${pages} pages. Next page would be:\n${next}`);
+      save('-test');
+      download(fileBase + '-test-raw.json', JSON.stringify(rawPages, null, 2), 'application/json');
+      delete window.__teamsExport;
+      return;
+    }
+    url = next;
+    state.next = url;
+    await sleep(PAUSE_MS);
+  }
+
+  state.done = true;
+  state.next = null;
+  console.log(`Done: ${state.messages.size} messages.`);
+  save(MAX_PAGES ? '-test' : '');
+  if (MAX_PAGES) delete window.__teamsExport;
+
+  // The copied request is usually a mid-history page (it has a syncState cursor), so drop the
+  // cursor and ask for the newest page instead. String edits rather than URLSearchParams so
+  // the rest of the query (e.g. the "|" in view=) goes back exactly as Teams sent it.
+  function withPageSize(u) {
+    const [base, query = ''] = u.split('?');
+    const params = query
+      .split('&')
+      .filter((p) => p && !/^(syncState|startTime|pageSize)=/.test(p));
+    params.push(`pageSize=${PAGE_SIZE}`, 'startTime=1');
+    return `${base}?${params.join('&')}`;
+  }
+
+  async function fetchWithRetry(u) {
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      let res;
+      try {
+        res = await fetch(u, init);
+      } catch (err) {
+        console.warn('Network error, retrying:', err.message);
+        await sleep(1000 * 2 ** attempt);
+        continue;
+      }
+      if (res.ok) return res;
+      if (res.status === 401 || res.status === 403) {
+        console.error(`HTTP ${res.status}: token expired or rejected.`);
+        return null;
+      }
+      if (res.status === 429 || res.status >= 500) {
+        const retryAfter = Number(res.headers.get('Retry-After'));
+        const wait = retryAfter > 0 ? retryAfter * 1000 : 1000 * 2 ** attempt;
+        console.warn(`HTTP ${res.status}, waiting ${Math.round(wait / 1000)}s...`);
+        await sleep(wait);
+        continue;
+      }
+      console.error(`HTTP ${res.status}:`, await res.text());
+      return null;
+    }
+    console.error('Gave up after repeated failures.');
+    return null;
+  }
+
+  function save(suffix) {
+    const sorted = [...state.messages.values()].sort((a, b) => timeOf(a) - timeOf(b));
+    download(fileBase + suffix + '.json', JSON.stringify(sorted, null, 2), 'application/json');
+    download(fileBase + suffix + '.txt', sorted.map(toLine).join('\n'), 'text/plain');
+  }
+
+  function timeOf(m) {
+    return Date.parse(m.originalarrivaltime || m.composetime) || Number(m.id) || 0;
+  }
+
+  function toLine(m) {
+    const d = new Date(timeOf(m));
+    const pad = (n) => String(n).padStart(2, '0');
+    const when = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    const name = m.imdisplayname || (m.from || '').split('/').pop() || 'unknown';
+    const props = m.properties || {};
+    const type = m.messagetype || '';
+
+    if (props.deletetime) return `${when}  ${name}: [deleted]`;
+    if (!/^(Text|RichText|RichText\/Html)$/.test(type)) return `${when}  [${type || 'event'}]`;
+
+    const text = type === 'Text' ? m.content || '' : htmlToText(m.content || '');
+    const edited = props.edittime ? ' (edited)' : '';
+    return `${when}  ${name}: ${text}${edited}`;
+  }
+
+  function htmlToText(html) {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    doc.querySelectorAll('br').forEach((br) => br.replaceWith('\n'));
+    doc.querySelectorAll('p, div, li').forEach((el) => el.append('\n'));
+    return doc.body.textContent.replace(/\n{3,}/g, '\n\n').trim();
+  }
+
+  function download(name, text, type) {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([text], { type }));
+    a.download = name;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  }
+})();
